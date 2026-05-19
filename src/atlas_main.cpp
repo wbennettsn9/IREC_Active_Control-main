@@ -865,7 +865,7 @@ unsigned long update_imu(unsigned long prevTime, Vec3 gyro, Vec3 accel, int mode
   }
   
   // Complimentary Filter
-  /*float s_w = 0.00884f;
+  float s_w = 0.00884f;
   float s_v = 0.119f;
   float x_k = filteredState.x;
   float x_dot_k = filteredState.y;
@@ -879,7 +879,7 @@ unsigned long update_imu(unsigned long prevTime, Vec3 gyro, Vec3 accel, int mode
   filteredState.x = x_k;
   filteredState.y = x_dot_k;
 
-  Serial.print("Baro:");
+  /*Serial.print("Baro:");
   Serial.print(barometer.z);
   Serial.print(",");
   Serial.print("X:");
