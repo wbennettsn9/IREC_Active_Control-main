@@ -575,6 +575,16 @@ void loop() {
       telemetryRate = 5;
       // Activate Control loop
 
+      if(millis()-t_launch>22000){
+        brake.writeMicroseconds(airbrakeServoPWM(0.0f));
+        delta_AB = (0.0f);
+      }
+      
+      if(millis()-t_launch>18000 && millis()-t_launch<22000){
+        brake.writeMicroseconds(airbrakeServoPWM(30.0f));
+        delta_AB = (30.0f / 57.2958f);
+      }
+
       // Roll Program (at 6s, 90 deg step, 2s later, -180 deg step, 2s later, 90 deg step, 2s later sine wave with ±90 degree amplitude, 3s period, for 6 seconds)
       if(millis()-t_launch>12000 && millis()-t_launch<18000){
         int progTime = 12000 - (millis()-t_launch);
@@ -582,22 +592,30 @@ void loop() {
         float B = 2.0f * PI / period;
         float A = PI/2.0f;
         roll_target = A * sin(progTime * B);
-        Serial.println(roll_target);
+        //Serial.println(roll_target);
+        delta_AB = (0.0f);
+        brake.writeMicroseconds(airbrakeServoPWM(0.0f));
       }
       
       if(millis()-t_launch>10000 && millis()-t_launch<12000){
         roll_target = 0.0f;
-        Serial.println(roll_target);
+        //Serial.println(roll_target);
+        delta_AB = (30.0f / 57.2958f);
+        brake.writeMicroseconds(airbrakeServoPWM(30.0f));
       }
 
       if(millis()-t_launch>8000 && millis()-t_launch<10000){
         roll_target = -PI/2.0f;
-        Serial.println(roll_target);
+        //Serial.println(roll_target);
+        delta_AB = (20.0f / 57.2958f);
+        brake.writeMicroseconds(airbrakeServoPWM(20.0f));
       }
 
       if(millis()-t_launch>6000 && millis()-t_launch<8000){
         roll_target = PI/2.0f;
-        Serial.println(roll_target);
+        //Serial.println(roll_target);
+        delta_AB = (10.0f / 57.2958f);
+        brake.writeMicroseconds(airbrakeServoPWM(10.0f));
       }
 
       // PID loop
@@ -606,7 +624,8 @@ void loop() {
       Ie += e * dt;
       De = angularVelocity.x;
       //Ti = Kp / Ki;
-      //Td = Kd / Kp;
+      //Td = Kd / Kp
+      
       //u = u_buffer[0] + Kp * ((1 + dt / Ti + Td / dt) * e + (-1 - 2.0f * Td / dt) * e_buffer[0] + Td * e_buffer[1] / dt);
       u = Kp * e + Ki * Ie + Kd * De;
       A = 0.0013;
@@ -618,7 +637,7 @@ void loop() {
       fin.write(servoAngle(delta * 57.2958f,-30,30));
 
       estimateApogeeOld(filteredState[0], filteredState[1], delta_AB);
-      e_AB = apogee_target - filteredState[2];
+      /*e_AB = apogee_target - filteredState[2];
       k = 50;
       rho = 1.225f*exp(-filteredState[0]/8500);
       CD_r = 0.55f;
@@ -627,7 +646,7 @@ void loop() {
       CD_t = -(2 * k * e_AB + rho * filteredState[1] * filteredState[1] * CD_r * A_r)/(rho * filteredState[1] * filteredState[1] * A_f);
       delta_AB = (CD_t-1.3886f)/0.9038f;
       delta_AB = constrain(delta_AB,0,max_delta_AB);
-      brake.writeMicroseconds(airbrakeServoPWM(delta_AB * 57.2958f));
+      brake.writeMicroseconds(airbrakeServoPWM(delta_AB * 57.2958f));*/
       // check saftey parameters to closout
       if(phi > max_dev || inertialAccel.z > 0){
         //Serial.println("UNSAFE ANGLE/MOTOR ACCELERATION DETECTED, DISABLING ACTIVE CONTROL");
