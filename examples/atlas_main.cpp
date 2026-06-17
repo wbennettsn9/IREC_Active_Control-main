@@ -14,7 +14,7 @@
 #include "DataLogger.h"
 
 // setting up pins for the HAL
-#define BUZZER_PIN 48
+// #define BUZZER_PIN 48
 
 static const int PIN_SCK  = 5;
 static const int PIN_MISO = 7;
@@ -36,27 +36,33 @@ Adafruit_ICM20649 icm;
 Adafruit_BMP280 bmp(BMP_CS, &spi);
 
 int telemetryRate = 100; // telemetry rate in ms
+int apogeeRate = 100; // rate at which apogee estimation runs
 unsigned long previousMillis = 0;
 
 // Global Vectors/Quaternions initialization
 // Since these are global the current code does not use their histories in this way
 Vec3 ig_cal; // Current calibrations
 Vec3 ia_cal;
+Vec3 ib_cal;
 Vec3 angularVelocity; 
 Vec3 bodyAccel;
 Vec3 inertialAccel;
 Vec3 inertialVelocity;
 Vec3 bodyUpDirection = Vec3(1.0f,0.0f,0.0f);
+Vec3 barometer; // Pressure (Pa), Temperature (C), Altitude (m)
+float filteredState[3] = {0.0f,0.0f,0.0f}; // x_k, x_dot_k, estimated apogee
 
 Quat orientationQuat;
 Quat rotationQuat;
 float roll_target = 0;
+float apogee_target = 2743;
 float roll;
 float eulerRoll;
 float eulerPitch;
 float eulerYaw;
 float phi;
-float g;
+float g = 9.80665;
+float accel_calibration = 1.0f;
 
 unsigned int dt = 1; // Main Loop Run Time, ms
 unsigned int dt2 = 1; // Main Loop Run Time, ms
@@ -73,6 +79,9 @@ sensors_event_t temp;
 // Servo Configuration
 Servo fin;
 int servoPin = 19;
+
+Servo brake;
+int brakePin = 48;
 
 // Low Pass Filtering for gyro bias compensation
 unsigned int stationaryTimer = 0;
@@ -116,20 +125,31 @@ unsigned int accelerationTimer = 100; // minimum time that accel must be > maxAc
 
 // Flight Timers
 unsigned long t_launch; // timestamp of launch in ms
-unsigned int t_burnout = 6500; // ms after to begin active control
+unsigned int t_burnout = 3900; // ms after to begin active control
 unsigned int t_apogee = 27000; // ms after launch to begin closout
+unsigned int t_closeout = 300000; // ms after launch to finish closout
 
 // PID/Control Loop Constants
-float Kp = 5.0f;
-float Ki = 1.0f;
-float Kd = 0.01f;
+float Kp = 2.0f;
+float Ki = 0.5f;
+float Kd = 0.5f;
 float u = 0; // input
-float e = 0; // error
+float e = 0; // error for roll control
+float e_AB = 0; // error for airbrakes
 float Ie = 0; // integral error
 float De = 0; // derivative error
 float q; // dynamic pressure
-float delta = 0;
-float max_dev; // max tilt angle
+float delta = 0; // Aileron deflection angle (rad)
+float delta_AB = 0; // Airbrake deflection angle (rad)
+float k;
+float rho;
+float CD_r;
+float A_r;
+float A_f;
+float CD_t;
+float max_dev = 30.0f * 0.0174533f; // max rocket tilt angle for active controls
+float max_delta = 15.0f * 0.0174533f; // max aileron deflection angle
+float max_delta_AB = 30.0f * 0.0174533f; // max airbrake deflection angle, deg
 float A; // control surface area
 
 class Telemetry{
@@ -139,10 +159,11 @@ class Telemetry{
     }
     int toCSV(char* buffer, size_t size) const {
         return snprintf(buffer, size,
-             "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+             "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
              (float)sys, (float)liftoffDetected, millis()-t_launch
              , angularVelocity.x, angularVelocity.y, angularVelocity.z
              , bodyAccel.x, bodyAccel.y, bodyAccel.z
+             , barometer.x, barometer.y, barometer.z
              , inertialAccel.x, inertialAccel.y, inertialAccel.z
              , inertialVelocity.x, inertialVelocity.y, inertialVelocity.z
              , rotationQuat.q0, rotationQuat.q1, rotationQuat.q2, rotationQuat.q3
@@ -165,13 +186,19 @@ unsigned long lastFlush = 0;
 void setup_imu_sensor();
 Vec3 calibrateGyro(int samples, int dt);
 Vec3 calibrateAccelerometer(int samples, int dt);
+Vec3 calibrateBarometer(int samples, int dt);
+float pressureAltitude(float pressure, float p_ref);
 unsigned long init_imu();
 void reset_imu();
 float noiseFilter(float sensor, float cutoff);
 Vec3 vecFilter(Vec3 sensor, float cutoff);
 unsigned long update_imu(unsigned long prevTime, Vec3 gyro, Vec3 accel, int mode, bool updateVelocity);
+void estimateApogee(float h, float V, float deltaAB, float delT);
+void estimateApogeeOld(float h, float V, float deltaAB);
 void compute_angles();
+float getTilt(Vec3 Accel);
 float servoAngle(float angle, float minAngle, float maxAngle);
+int airbrakeServoPWM(float angle);
 void update_buffer(float src, float *buffer);
 
 bool initSDLogFile() {
@@ -187,7 +214,7 @@ bool initSDLogFile() {
     return false;
   }
 
-  logFile.println("Time_ms, System_State, Liftoff_Detected, Time_Since_Launch_ms, W_X, W_Y, W_Z, Body_A_X, Body_A_Y, Body_A_Z, Inertial_A_X, Inertial_A_Y, Inertial_A_Z, V_X, V_Y, V_Z, Rot_q0, Rot_q1, Rot_q2, Rot_q3, Phi_rad, Roll_rad, Roll_Target_rad, E_P, E_I, E_D, Fin_Deflection_rad, u, q_Pa, Integration_Mode, Integrate_Velocity, dt_us");
+  logFile.println("Time_ms, System_State, Liftoff_Detected, Time_Since_Launch_ms, W_X, W_Y, W_Z, Body_A_X, Body_A_Y, Body_A_Z, Inertial_A_X, Inertial_A_Y, Inertial_A_Z, V_X, V_Y, V_Z, Pressure, Temperature_C, Baro_Alt, Filtered_Altitude, Filtered_Vertical_Velocity, Estimated_Apogee, Rot_q0, Rot_q1, Rot_q2, Rot_q3, Phi_rad, Roll_rad, Roll_Target_rad, E_P, E_I, E_D, Fin_Deflection_rad, u, q_Pa, CD_t, delta_AB_rad, Integration_Mode, Integrate_Velocity, dt_us");
   logFile.flush();
   return !logFile.getWriteError();
 }
@@ -234,6 +261,18 @@ bool log(unsigned long t) {
   logFile.print(',');
   logFile.print(inertialVelocity.z,4);
   logFile.print(',');
+  logFile.print(barometer.x,4);
+  logFile.print(',');
+  logFile.print(barometer.y,4);
+  logFile.print(',');
+  logFile.print(barometer.z,4);
+  logFile.print(',');
+  logFile.print(filteredState[0],4);
+  logFile.print(',');
+  logFile.print(filteredState[1],4);
+  logFile.print(',');
+  logFile.print(filteredState[2],4);
+  logFile.print(',');
   logFile.print(rotationQuat.q0,4);
   logFile.print(',');
   logFile.print(rotationQuat.q1,4);
@@ -260,6 +299,10 @@ bool log(unsigned long t) {
   logFile.print(',');
   logFile.print(q,4);
   logFile.print(',');
+  logFile.print(CD_t,4);
+  logFile.print(',');
+  logFile.print(delta_AB,4);
+  logFile.print(',');
   logFile.print(integrationMode);
   logFile.print(',');
   logFile.print(integrateVelocity);
@@ -277,7 +320,6 @@ bool log(unsigned long t) {
 void setup(void) {
   // replace with device objects
   Serial.begin(115200);
-  pinMode(BUZZER_PIN, OUTPUT);
   
   pinMode(SD_CS, OUTPUT);
   pinMode(BMP_CS, OUTPUT);
@@ -310,7 +352,6 @@ void setup(void) {
     delay(1000);
   }
   Serial.println("BMP280 Found!");
-  digitalWrite(BUZZER_PIN, LOW);
 
   Serial.println("Setting up ICM IMU");
   if (!initSDLogFile()) {
@@ -322,11 +363,18 @@ void setup(void) {
   Serial.println("Starting Calibration Sequence");
   Serial.println("Starting Accelerometer Static Calibration");
   ia_cal = calibrateAccelerometer(5000,1);
-  g = ia_cal.norm();
+  float g_meas = ia_cal.norm();
+  accel_calibration = g/g_meas;
   Serial.print("g0 = ");
-  Serial.println(g);
+  Serial.println(g_meas);
+  Serial.print("Calibration Factor = ");
+  Serial.println(accel_calibration);
+  Serial.print("Tilt Angle = ");
+  Serial.println(getTilt(ia_cal)*180/PI);
   Serial.println("Starting Gyro Static Calibration");
   ig_cal = calibrateGyro(5000, 1);
+  Serial.println("Starting Barometer Pressure/Temperature Calibration");
+  ib_cal = calibrateBarometer(5000, 1);
   Serial.println("Initialize IMU");
 
   // Servo Startup
@@ -335,12 +383,13 @@ void setup(void) {
 	ESP32PWM::allocateTimer(2);
 	ESP32PWM::allocateTimer(3);
 	fin.setPeriodHertz(50);    // standard 50 hz servo
-	fin.attach(servoPin, 900, 2100); // attaches the servo on pin 1 to the servo object
-	// using default min/max of 1000us and 2000us
-	// different servos may require different min/max settings
-	// for an accurate 0 to 180 sweep
+	fin.attach(servoPin, 900, 2125);
 
-  Serial.print("Testing Servos\n");
+  brake.setPeriodHertz(50);    // standard 50 hz servo
+  brake.writeMicroseconds(airbrakeServoPWM(0));
+	brake.attach(brakePin, 500, 2500);
+
+  Serial.print("Testing Roll Control Servo\n");
   fin.write(servoAngle(0,-60,60));
   delay(1000);
   fin.write(servoAngle(60,-60,60));
@@ -349,6 +398,33 @@ void setup(void) {
   delay(1000);
   fin.write(servoAngle(0,-60,60));
   delay(1000);
+
+  if (getTilt(ia_cal)*180/PI > 45)
+  {
+    Serial.print("Testing Airbrake Servo\n");
+    brake.writeMicroseconds(airbrakeServoPWM(0));
+    delay(1000);
+    brake.writeMicroseconds(airbrakeServoPWM(30));
+    delay(1000);
+    brake.writeMicroseconds(airbrakeServoPWM(15));
+    delay(1000);
+    brake.writeMicroseconds(airbrakeServoPWM(0));
+    delay(1000);
+    //Serial.print("Testing Apogee Estimation\n");
+    //unsigned long t2;
+    //unsigned long t1 = micros();
+    //estimateApogeeOld(738.0f, 277.0f, 0);
+    //t2 = micros();
+    //Serial.print("Estimated Apogee: ");
+    //Serial.print(filteredState[2]);
+    //Serial.print(", ");
+    //Serial.println(t2-t1);
+    //delay(5000);
+  }
+  else
+  {
+    Serial.print("Tilt less than 45°, aitbrake check skipped\n");
+  }
 
   delay(1000);
   SPI.setFrequency(7000000);
@@ -372,6 +448,10 @@ void loop() {
   Vec3 rawAccel;
   Vec3 calAccel;
   Vec3 rawBodyAccel;
+
+  barometer.x = bmp.readPressure();
+  barometer.y = bmp.readTemperature();
+  barometer.z = pressureAltitude(barometer.x,101325) - ib_cal.z;
 
   rawGyro.x = gyro.gyro.x;
   rawGyro.y = gyro.gyro.y;
@@ -403,9 +483,9 @@ void loop() {
     // Serial.println("IMU Moving");
   }
 
-  rawAccel.x = accel.acceleration.x;
-  rawAccel.y = accel.acceleration.y;
-  rawAccel.z = accel.acceleration.z;
+  rawAccel.x = accel.acceleration.x * accel_calibration;
+  rawAccel.y = accel.acceleration.y * accel_calibration;
+  rawAccel.z = accel.acceleration.z * accel_calibration;
 
   // Transform IMU frame to body frame. Y up in IMU frame is X up in body frame
   // I can give raw Bframe or I can give calibrated Bframes
@@ -480,11 +560,11 @@ void loop() {
     case LIFTOFF:
       integrationMode = 2;
       integrateVelocity = true;
-      telemetryRate = 20;
+      telemetryRate = 5;
       // Check if it is time to activate control system, after motor burnout
       if(millis()-t_launch>t_burnout){
         sys = groundTest == true ? GROUND_TEST : ACTIVE_CONTROL;
-        roll_target = roll;
+        roll_target = 0.0f;
         Serial.println("Burnout timer passed");
         break;
       }
@@ -492,29 +572,86 @@ void loop() {
     case ACTIVE_CONTROL:
       integrationMode = 2;
       integrateVelocity = true;
-      telemetryRate = 20;
+      telemetryRate = 5;
       // Activate Control loop
+
+      if(millis()-t_launch>22000){
+        brake.writeMicroseconds(airbrakeServoPWM(0.0f));
+        delta_AB = (0.0f);
+      }
+      
+      if(millis()-t_launch>18000 && millis()-t_launch<22000){
+        brake.writeMicroseconds(airbrakeServoPWM(30.0f));
+        delta_AB = (30.0f / 57.2958f);
+      }
+
+      // Roll Program (at 6s, 90 deg step, 2s later, -180 deg step, 2s later, 90 deg step, 2s later sine wave with ±90 degree amplitude, 3s period, for 6 seconds)
+      if(millis()-t_launch>12000 && millis()-t_launch<18000){
+        int progTime = 12000 - (millis()-t_launch);
+        int period = 3000; // 3s sine wave period
+        float B = 2.0f * PI / period;
+        float A = PI/2.0f;
+        roll_target = A * sin(progTime * B);
+        //Serial.println(roll_target);
+        delta_AB = (0.0f);
+        brake.writeMicroseconds(airbrakeServoPWM(0.0f));
+      }
+      
+      if(millis()-t_launch>10000 && millis()-t_launch<12000){
+        roll_target = 0.0f;
+        //Serial.println(roll_target);
+        delta_AB = (30.0f / 57.2958f);
+        brake.writeMicroseconds(airbrakeServoPWM(30.0f));
+      }
+
+      if(millis()-t_launch>8000 && millis()-t_launch<10000){
+        roll_target = -PI/2.0f;
+        //Serial.println(roll_target);
+        delta_AB = (20.0f / 57.2958f);
+        brake.writeMicroseconds(airbrakeServoPWM(20.0f));
+      }
+
+      if(millis()-t_launch>6000 && millis()-t_launch<8000){
+        roll_target = PI/2.0f;
+        //Serial.println(roll_target);
+        delta_AB = (10.0f / 57.2958f);
+        brake.writeMicroseconds(airbrakeServoPWM(10.0f));
+      }
+
       // PID loop
       e = roll - roll_target; // in radians
       dt = (t_buffer[0] - t_buffer[1]) / 1000000; // in seconds
       Ie += e * dt;
       De = angularVelocity.x;
       //Ti = Kp / Ki;
-      //Td = Kd / Kp;
+      //Td = Kd / Kp
+      
       //u = u_buffer[0] + Kp * ((1 + dt / Ti + Td / dt) * e + (-1 - 2.0f * Td / dt) * e_buffer[0] + Td * e_buffer[1] / dt);
       u = Kp * e + Ki * Ie + Kd * De;
-      A = 0.0013f;
+      A = 0.0013;
       q = 0.5f * (1.112f) * inertialVelocity.norm() * inertialVelocity.norm();
       delta = 2.0f * u / (0.0892f * q * A * 6.66f);
-      Ie = abs(delta * 57.2958f) > 20 ? Ie_buffer[0] : Ie;
+      delta = constrain(delta,-max_delta,max_delta);
+      Ie = abs(delta * 57.2958f) > 15 ? Ie_buffer[0] : Ie;
 
-      fin.write(servoAngle(delta * 57.2958f,-20,20));
-      
+      fin.write(servoAngle(delta * 57.2958f,-30,30));
+
+      estimateApogeeOld(filteredState[0], filteredState[1], delta_AB);
+      /*e_AB = apogee_target - filteredState[2];
+      k = 50;
+      rho = 1.225f*exp(-filteredState[0]/8500);
+      CD_r = 0.55f;
+      A_r = 0.019478f;
+      A_f = 3*2/1550.0f;
+      CD_t = -(2 * k * e_AB + rho * filteredState[1] * filteredState[1] * CD_r * A_r)/(rho * filteredState[1] * filteredState[1] * A_f);
+      delta_AB = (CD_t-1.3886f)/0.9038f;
+      delta_AB = constrain(delta_AB,0,max_delta_AB);
+      brake.writeMicroseconds(airbrakeServoPWM(delta_AB * 57.2958f));*/
       // check saftey parameters to closout
-      max_dev = 30.0f * 0.0174533f;
-      if(phi > max_dev){
-        Serial.println("UNSAFE ANGLE DETECTED, DISABLING ROLL CONTROL");
+      if(phi > max_dev || inertialAccel.z > 0){
+        //Serial.println("UNSAFE ANGLE/MOTOR ACCELERATION DETECTED, DISABLING ACTIVE CONTROL");
         //fin.write(servoAngle(0.0f,-30,30));
+        //brake.writeMicroseconds(0.0f));
         //sys = CLOSEOUT;
       }
       if(millis()-t_launch>t_apogee){
@@ -526,7 +663,6 @@ void loop() {
     case GROUND_TEST:
       // Activate Ground Test Loop
       // PID loop
-      digitalWrite(BUZZER_PIN, HIGH);
       integrationMode = 2;
       integrateVelocity = true;
       e = roll - roll_target; // in radians
@@ -582,19 +718,26 @@ void loop() {
     }
 
     case CLOSEOUT:
-      Serial.println("Closeout complete!");
-      while(1){
+      Serial.println("Closeout started!");
+      telemetryRate = 100;
+      fin.write(servoAngle(0.0f,-20,20));
+      if(millis()-t_launch>t_closeout){
+        Serial.println("Closeout Complete!");
+        while(1){
         delay(10);
+        }
       }
+
     break;
   }
   unsigned long now = millis();
   unsigned long currentMillis = now; // Get current time
+
+  digitalWrite(SD_CS, HIGH);
+  digitalWrite(BMP_CS, HIGH);
+  digitalWrite(ICM_CS, HIGH);
   
   if(SDC == true){
-    digitalWrite(SD_CS, HIGH);
-    digitalWrite(BMP_CS, HIGH);
-    digitalWrite(ICM_CS, HIGH);
 
     if (currentMillis - previousMillis >= telemetryRate) {
       previousMillis = currentMillis; // Update the last execution time
@@ -608,7 +751,7 @@ void loop() {
     if (now - lastFlush >= FLUSH_PERIOD_MS) {
       logFile.flush();
     lastFlush = now;
-  }
+    }
   }
 }
 
@@ -711,6 +854,33 @@ Vec3 calibrateAccelerometer(int samples, int dt){
   return sensor_cal;
 }
 
+Vec3 calibrateBarometer(int samples, int dt){
+  Vec3 sensor_cal;
+  sensor_cal.x = 0;
+  sensor_cal.y = 0;
+  sensor_cal.z = 0;
+  for(int i = 0; i<samples; i++){
+    sensor_cal.x+=(double)(bmp.readPressure()/samples);
+    sensor_cal.y+=(double)(bmp.readTemperature()/samples);
+    delay(dt);
+  }
+  sensor_cal.z = pressureAltitude(sensor_cal.x,101325);
+  Serial.println("Barometer Calibration complete");
+  Serial.print("Pressure : ");
+  Serial.print(sensor_cal.x);
+  Serial.print(" Pa, Temperature : ");
+  Serial.print(sensor_cal.y);
+  Serial.print(" C, Base Altitude : ");
+  Serial.print(sensor_cal.z);
+  Serial.print(" m");
+  Serial.println();
+  return sensor_cal;
+}
+
+float pressureAltitude(float pressure, float p_ref){
+  return 44307.7 * (1.0 - pow(pressure / p_ref, 0.190284));
+}
+
 // Sets the IMU to default values
 unsigned long init_imu(){
 	rotationQuat = Quat(1.0f,0.0f,0.0f,0.0f);
@@ -792,8 +962,59 @@ unsigned long update_imu(unsigned long prevTime, Vec3 gyro, Vec3 accel, int mode
   if (updateVelocity) {
     inertialVelocity = inertialVelocity + (inertialAccel * ((float)dt / 1000000));
   }
+  
+  // Complimentary Filter
+  float s_w = 0.00884f;
+  float s_v = 0.119f;
+  float x_k = filteredState[0];
+  float x_dot_k = filteredState[1];
+  float k1 = sqrt(2 * s_w/s_v);
+  float k2 = s_w/s_v;
+  float Ts = (float)dt / 1000000;
+  float dx = barometer.z - x_k;
+  float dv = Ts * inertialAccel.z;
+  x_k = x_k + x_dot_k * Ts + (k1 + k2 * 0.5f * Ts) * Ts * dx + Ts * 0.5f * dv;
+  x_dot_k = x_dot_k + k2 * Ts * dx + dv;
+  filteredState[0] = x_k;
+  filteredState[1] = x_dot_k;
+
+  /*Serial.print("Baro:");
+  Serial.print(barometer.z);
+  Serial.print(",");
+  Serial.print("X:");
+  Serial.print(x_k);
+  Serial.print(",");
+  Serial.print("X_dot:");
+  Serial.print(x_dot_k);
+  Serial.println();*/
 
   return prevTime + dt;
+}
+
+void estimateApogee(float h, float V) {
+  float m = 22.5;
+  float rho = 1.225*exp(-h/8500);
+  float Cd = 0.55;
+  float k = (rho * Cd * 0.0193f);
+  filteredState[2] = h + m / k * log(1.0f + k * V * V / (2 * m * g)); // estimated apogee
+}
+
+void estimateApogeeOld(float h, float V, float deltaAB) {
+  float m = 23.35;
+  float Num_AB = 3;
+  float g = 9.80665;
+  float E_Drag_sim = 0;
+  float Cd_AB = deltaAB * 0.7791; 
+  float Cd_r = 0.2; //update as fcn of velocity
+  float A_r = 0.019477;
+  float A_AB = 3*2/1550.0f;
+  float rho = 1.225*exp(-h/8500);
+  float q_AB = 0.5 * rho * V * V;
+  
+  float a = (m*g+q_AB*Cd_r*A_r+q_AB*Cd_AB*A_AB)/m;
+  float hmax= h + (V*V)/(2*a);
+
+  filteredState[2] = hmax;
 }
 
 void compute_angles() 
@@ -804,11 +1025,28 @@ void compute_angles()
   phi = acos(orientationQuat.q3);
 }
 
+float getTilt(Vec3 Accel) { // used to get tilt angle in STARTUP mode, does not perform airbrakes test if vehicle is within 45 degrees of vertical
+  return acos(Accel.y/Accel.norm());
+}
+
 float servoAngle(float angle, float minAngle, float maxAngle) {
   float targetAngle = constrain(angle, minAngle, maxAngle);
   targetAngle *= 1.5; // Scaling factor for servo travel of ±60 degrees for commanded input of ±90 degrees
   targetAngle += 90; // Shifts center from 0 to 90
   return targetAngle;
+}
+
+int airbrakeServoPWM(float angle) {
+  int retractedPWM = 810;
+  int extendedPWM = 500;
+  int maxAngle = 30;
+  int minAngle = 0;
+  angle = constrain(angle, minAngle, maxAngle);
+
+  int PWMRange = retractedPWM - extendedPWM;
+  float deflection = (angle - minAngle)/(maxAngle - minAngle);
+  int PWM = (int)(retractedPWM - deflection * PWMRange);
+  return constrain(PWM,extendedPWM,retractedPWM);
 }
 
 void update_buffer(float src, float *buffer){
