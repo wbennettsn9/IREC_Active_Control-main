@@ -55,7 +55,7 @@ float filteredState[3] = {0.0f,0.0f,0.0f}; // x_k, x_dot_k, estimated apogee
 Quat orientationQuat;
 Quat rotationQuat;
 float roll_target = 0;
-float apogee_target = 2743;
+float apogee_target = 2957;
 float roll;
 float eulerRoll;
 float eulerPitch;
@@ -126,7 +126,7 @@ unsigned int accelerationTimer = 100; // minimum time that accel must be > maxAc
 // Flight Timers
 unsigned long t_launch; // timestamp of launch in ms
 unsigned int t_burnout = 3900; // ms after to begin active control
-unsigned int t_apogee = 27000; // ms after launch to begin closout
+unsigned int t_apogee = 28000; // ms after launch to begin closout
 unsigned int t_closeout = 300000; // ms after launch to finish closout
 
 // PID/Control Loop Constants
@@ -575,49 +575,6 @@ void loop() {
       telemetryRate = 5;
       // Activate Control loop
 
-      if(millis()-t_launch>22000){
-        brake.writeMicroseconds(airbrakeServoPWM(0.0f));
-        delta_AB = (0.0f);
-      }
-      
-      if(millis()-t_launch>18000 && millis()-t_launch<22000){
-        brake.writeMicroseconds(airbrakeServoPWM(30.0f));
-        delta_AB = (30.0f / 57.2958f);
-      }
-
-      // Roll Program (at 6s, 90 deg step, 2s later, -180 deg step, 2s later, 90 deg step, 2s later sine wave with ±90 degree amplitude, 3s period, for 6 seconds)
-      if(millis()-t_launch>12000 && millis()-t_launch<18000){
-        int progTime = 12000 - (millis()-t_launch);
-        int period = 3000; // 3s sine wave period
-        float B = 2.0f * PI / period;
-        float A = PI/2.0f;
-        roll_target = A * sin(progTime * B);
-        //Serial.println(roll_target);
-        delta_AB = (0.0f);
-        brake.writeMicroseconds(airbrakeServoPWM(0.0f));
-      }
-      
-      if(millis()-t_launch>10000 && millis()-t_launch<12000){
-        roll_target = 0.0f;
-        //Serial.println(roll_target);
-        delta_AB = (30.0f / 57.2958f);
-        brake.writeMicroseconds(airbrakeServoPWM(30.0f));
-      }
-
-      if(millis()-t_launch>8000 && millis()-t_launch<10000){
-        roll_target = -PI/2.0f;
-        //Serial.println(roll_target);
-        delta_AB = (20.0f / 57.2958f);
-        brake.writeMicroseconds(airbrakeServoPWM(20.0f));
-      }
-
-      if(millis()-t_launch>6000 && millis()-t_launch<8000){
-        roll_target = PI/2.0f;
-        //Serial.println(roll_target);
-        delta_AB = (10.0f / 57.2958f);
-        brake.writeMicroseconds(airbrakeServoPWM(10.0f));
-      }
-
       // PID loop
       e = roll - roll_target; // in radians
       dt = (t_buffer[0] - t_buffer[1]) / 1000000; // in seconds
@@ -636,23 +593,17 @@ void loop() {
 
       fin.write(servoAngle(delta * 57.2958f,-30,30));
 
-      estimateApogeeOld(filteredState[0], filteredState[1], delta_AB);
-      /*e_AB = apogee_target - filteredState[2];
-      k = 50;
-      rho = 1.225f*exp(-filteredState[0]/8500);
-      CD_r = 0.55f;
-      A_r = 0.019478f;
-      A_f = 3*2/1550.0f;
-      CD_t = -(2 * k * e_AB + rho * filteredState[1] * filteredState[1] * CD_r * A_r)/(rho * filteredState[1] * filteredState[1] * A_f);
-      delta_AB = (CD_t-1.3886f)/0.9038f;
+      estimateApogee(filteredState[0], filteredState[1]);
+
+      e_AB = apogee_target - filteredState[2];
+      delta_AB = 1.0f/20.0f * e_AB * max_delta_AB;
       delta_AB = constrain(delta_AB,0,max_delta_AB);
-      brake.writeMicroseconds(airbrakeServoPWM(delta_AB * 57.2958f));*/
+      brake.writeMicroseconds(airbrakeServoPWM(delta_AB * 57.2958f));
       // check saftey parameters to closout
       if(phi > max_dev || inertialAccel.z > 0){
-        //Serial.println("UNSAFE ANGLE/MOTOR ACCELERATION DETECTED, DISABLING ACTIVE CONTROL");
-        //fin.write(servoAngle(0.0f,-30,30));
-        //brake.writeMicroseconds(0.0f));
-        //sys = CLOSEOUT;
+        Serial.println("UNSAFE ANGLE/MOTOR ACCELERATION DETECTED, DISABLING ACTIVE CONTROL");
+        fin.write(servoAngle(0.0f,-30,30));
+        brake.writeMicroseconds(airbrakeServoPWM(0.0f));
       }
       if(millis()-t_launch>t_apogee){
         sys = CLOSEOUT;
@@ -991,41 +942,12 @@ unsigned long update_imu(unsigned long prevTime, Vec3 gyro, Vec3 accel, int mode
   return prevTime + dt;
 }
 
-void estimateApogee(float h, float V, float deltaAB, float delT) {
-  float m = 23.35;
-  float V_sim = V;
-  float h_prev = h;
-  float h_sim = h;
-  float Num_AB = 3;
-  float g = 9.80665;
-  float E_Drag_sim = 0;
-  float Cd_AB = deltaAB * deltaAB * 0.0002 + deltaAB * 0.0014; //Use same approx from controller
-  float Cd_r = 0.55; //update as fcn of velocity
-  float A_r = 0.019477;
-  float A_AB = 3*2/1550.0f;
-  
-  while (V_sim > 0) {
-    float rho = 1.225*exp(-h_sim/8500);
-
-    float D_AB = Num_AB*.5*rho*V_sim*V_sim*A_AB*Cd_AB;
-    float D_r = .5*rho*V_sim*V_sim*A_r*Cd_r;
-
-    float a = g + D_r/m+D_AB/m;
-    Serial.print(a);
-    Serial.print(", ");
-    h_sim = h_sim + V_sim*delT;
-    V_sim = V_sim - a*delT;
-    Serial.print(a*delT);
-    Serial.print(", ");
-
-    E_Drag_sim = E_Drag_sim + (h_sim-h_prev)*(D_AB+D_r);
-    h_prev = h_sim;
-    Serial.print(h_sim);
-    Serial.print(", ");
-    Serial.println(V_sim);
-  }
-  float Delta_Apogee = (.5*m*V*V - E_Drag_sim)/(m*g);
-  filteredState[2] = Delta_Apogee + h;
+void estimateApogee(float h, float V) {
+  float m = 22.5;
+  float rho = 1.225*exp(-h/8500);
+  float Cd = 0.55;
+  float k = (rho * Cd * 0.0193f);
+  filteredState[2] = h + m / k * log(1.0f + k * V * V / (2 * m * g)); // estimated apogee
 }
 
 void estimateApogeeOld(float h, float V, float deltaAB) {
